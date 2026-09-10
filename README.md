@@ -1,6 +1,6 @@
 # 🎙️ Meeting Transcriber & Analyser
 
-> **Milestone 1** — Audio Processing, Transcription & Meeting Analysis  
+> **Milestone 1 & 2** — Audio Processing, Transcription & Meeting Intelligence Pipeline  
 > Powered by **OpenAI Whisper** + **Google Gemini 3.5 Flash**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://python.org)
@@ -31,13 +31,11 @@
 
 ## 🌟 Overview
 
-This project is a full end-to-end **meeting transcription and analysis pipeline** built as part of Milestone 1. It takes an audio or video recording of a meeting, transcribes it using OpenAI Whisper, and then runs a two-layer analysis:
+This project is a full end-to-end **meeting transcription and intelligence pipeline** built across Milestone 1 and Milestone 2. It takes an audio or video recording of a meeting, transcribes it using OpenAI Whisper, and then runs a two-layer analysis:
 
-1. **Python-based deterministic extraction** — speaker count estimation, topics, key points, action items, assigned persons, and deadlines. All extracted directly from the transcript using NLP algorithms, with zero API calls and zero hallucination risk.
+1. **Python-based deterministic extraction** — speaker count estimation, topics, key points, action items (with priority & status), assigned persons, and deadlines. All extracted directly from the transcript using NLP algorithms, with zero API calls and zero hallucination risk.
 
-2. **Gemini AI natural-language summary** — a fluent, coherent meeting summary produced by Google Gemini 3.5 Flash, constrained by a strict JSON schema to prevent the model from inventing anything not present in the transcript.
-
-Everything is exposed through a clean **Streamlit web interface** that guides the user step by step.
+2. **Gemini AI meeting intelligence** — a structured, validated analysis produced by Google Gemini 3.5 Flash: summary, key decisions, participants, key points, topics, and action items — all constrained by a strict JSON schema. The LLM service layer includes input validation, a truncation guard, retry logic, and full output validation.
 
 ---
 
@@ -51,22 +49,33 @@ Everything is exposed through a clean **Streamlit web interface** that guides th
 - Save transcript to `.txt` or download directly from the browser
 - Bundled `ffmpeg` binary — no separate system install needed
 
-### 🔍 Meeting Analysis (Task 10)
+### 🔍 Meeting Analysis (Milestone 1 Task 10 + Milestone 2)
+
 | Extraction | Method | API needed? |
 |---|---|---|
 | 👥 Estimated speaker count | KMeans clustering on Whisper segment acoustics | ❌ No |
 | 📌 Key topics | TF-IDF noun-phrase scoring | ❌ No |
 | 💡 Key discussion points | TF-IDF sentence scoring | ❌ No |
-| ✅ Action items | Regex + NLTK Named Entity Recognition | ❌ No |
+| ✅ Action items + priority + status | Regex + NLTK NER + urgency keywords | ❌ No |
 | 👤 Assigned person | NLTK NER (PERSON entities) + heuristic | ❌ No |
 | 📅 Deadlines / dates | Regex over 8 date pattern categories | ❌ No |
 | ✨ Meeting summary | **Gemini 3.5 Flash** (structured JSON) | ✅ Yes |
+| 🎯 Key decisions | **Gemini 3.5 Flash** (schema-enforced) | ✅ Yes |
+| 🙋 Participants | **Gemini 3.5 Flash** (no invention) | ✅ Yes |
 
 ### 🛡️ Anti-Hallucination Safeguards (Gemini)
-- Strict JSON schema with `additionalProperties: false`
-- `null` enforced for missing persons and deadlines — model cannot guess
-- System instruction explicitly forbids inventing names, tasks, or dates
+- Strict JSON schema with `additionalProperties: false` at every level
+- `null` enforced for missing persons, deadlines, and priorities — model cannot guess
+- System instruction explicitly forbids inventing names, decisions, tasks, or dates
 - Schema enforced at the API transport level via `response_format`
+- Output fully re-validated in Python after parsing — invalid values coerced to safe defaults
+
+### 🔒 LLM Service Hardening (Milestone 2 Task 1)
+- **Prompt templates** — system instruction and user message are named constants, editable without touching call logic
+- **Input validation** — rejects non-string input and transcripts under 20 characters
+- **Truncation guard** — transcripts over 800,000 characters are cut at the last sentence boundary; a warning is shown in the UI instead of silently dropping content or crashing
+- **Retry loop** — 3 attempts with exponential backoff (2 s → 4 s) on transient errors (timeout, rate limit, 429, 503); fast fail on auth errors
+- **Output validation** — every field type-checked and coerced; priority/status validated against allowed values
 
 ---
 
@@ -276,13 +285,20 @@ Click **🧠 Run Analysis** to get:
 - 👥 Estimated number of distinct speakers
 - 📌 Key topics (colour-coded pills)
 - 💡 Key discussion points (top sentences by importance)
-- ✅ Action items with assigned person and deadline
+- ✅ Action items — with assigned person, deadline, 🔴/🟠 priority badge, and PENDING/COMPLETED status badge
 - 📅 All dates and deadlines found in the transcript
 
-**Gemini AI Summary (requires `GEMINI_API_KEY`):**  
-Click **🚀 Generate AI Summary** to get a fluent paragraph summary plus structured key points, topics, and action items — all constrained to only what is in the transcript.
+**Gemini AI Intelligence (requires `GEMINI_API_KEY`):**  
+Click **🚀 Generate AI Summary** to get:
+- 📝 Fluent meeting summary paragraph
+- 🎯 Key decisions explicitly made in the meeting
+- 🙋 Participant names mentioned in the transcript
+- 💡 Key points, 📌 Topics
+- ✅ Action items with assigned person, deadline, priority, and status
 
-You can also paste your API key directly in the **sidebar** for quick testing without editing the `.env` file.
+If the transcript is too long (> 800,000 chars) a truncation warning appears above the results. If the API key is invalid or the network fails, a clean retry-then-fail error is shown instead of a raw stack trace.
+
+You can also paste your API key directly in the **sidebar** for quick testing.
 
 ---
 
@@ -327,7 +343,7 @@ Wraps OpenAI Whisper.
 | `_ensure_ffmpeg()` | Locates bundled ffmpeg and patches `whisper.audio.load_audio` |
 
 ### `meeting_analyzer.py`
-All Python-only, deterministic NLP extraction.
+All Python-only, deterministic NLP extraction (Milestone 2: priority + status added).
 
 | Function | Description |
 |----------|-------------|
@@ -335,15 +351,23 @@ All Python-only, deterministic NLP extraction.
 | `estimate_speaker_count(segments)` | KMeans on segment acoustic features (duration, position, logprob, wps) |
 | `extract_topics(transcript)` | TF-IDF noun-phrase scoring, returns top 8 topics |
 | `extract_key_points(transcript)` | TF-IDF sentence scoring, returns top 6 sentences |
-| `extract_action_items(transcript)` | Regex action-verb detection + NER person + date extraction |
+| `extract_action_items(transcript)` | Regex action-verb detection + NER + `_determine_priority()` + status="pending" |
+| `_determine_priority(sentence)` | `"high"` for urgency words · `"medium"` for near-term date · `null` otherwise |
 | `extract_deadlines(transcript)` | Regex over 8 date pattern categories |
 
 ### `gemini_summary.py`
-Gemini 3.5 Flash integration.
+Gemini 3.5 Flash LLM service layer (Milestone 2 hardened).
 
-| Function | Description |
-|----------|-------------|
-| `generate_meeting_summary(transcript)` | Calls Gemini with strict JSON schema. Returns `{summary, key_points, topics, action_items}` |
+| Symbol | Description |
+|--------|-------------|
+| `SYSTEM_INSTRUCTION` | Named constant — anti-hallucination + priority/status rules |
+| `build_user_message(transcript)` | Wraps transcript in standard request message |
+| `build_full_prompt(transcript)` | Combines system instruction + user message |
+| `RESPONSE_SCHEMA` | Full JSON schema: summary, key_points, decisions, participants, topics, action_items (with priority + status) |
+| `validate_transcript(transcript)` | Type check, min-length check, 800k-char truncation guard |
+| `_call_with_retry(client, prompt)` | 3-attempt retry with exponential backoff |
+| `_normalise_response(data)` | Full output type validation + coercion |
+| `generate_meeting_summary(transcript)` | Public entry point — validates, calls, normalises, returns dict |
 
 ---
 
@@ -372,29 +396,47 @@ Full speaker diarisation (knowing *who* said *what*) requires deep audio models.
 
 See [`Docs/milestones.md`](Docs/milestones.md) for the full breakdown.
 
-**Milestone 1 — Audio Processing & Transcription**
-- [x] Task 1 — Whisper Transcription workflow
-- [ ] Task 2 — File Upload Validation
-- [ ] Task 3 — Transcript Validation
-- [ ] Task 4 — Streamlit Interface verification
+### Milestone 1 — Audio Processing & Transcription
+- [x] Task 1 — Whisper Transcription workflow (end-to-end)
+- [ ] Task 2 — File Upload Validation (testing)
+- [ ] Task 3 — Transcript Validation (testing)
+- [ ] Task 4 — Streamlit Interface verification (testing)
 - [ ] Task 5 — Accuracy Testing (≥90% WER)
 
-**Milestone 1 — Text Ingestion & Baseline Sentiment**
+### Milestone 1 — Text Ingestion & Baseline Sentiment
 - [ ] Task 1 — Text Ingestion Workflow
 - [ ] Task 2 — Preprocessing Validation
 - [ ] Task 3 — VADER Sentiment Validation
 - [ ] Task 4 — Initial Emotion/Sentiment Report
-- [x] Task 5 (partial) — GitHub repo setup & Milestone 1 code pushed
+- [x] Task 5 (partial) — GitHub repo setup & code pushed
 
-**Meeting Analysis (Task 10)**
-- [x] Speaker estimation from audio
-- [x] Topic extraction
-- [x] Key discussion points
-- [x] Action item extraction
-- [x] Assigned person detection
-- [x] Deadline/date extraction
+### Milestone 1 — Meeting Analysis (Task 10)
+- [x] Speaker estimation from audio (KMeans)
+- [x] Topic extraction (TF-IDF)
+- [x] Key discussion points (TF-IDF sentence scoring)
+- [x] Action item extraction (regex + NER)
+- [x] Assigned person detection (NLTK NER)
+- [x] Deadline/date extraction (regex)
 - [x] Gemini 3.5 Flash structured summary
-- [x] Streamlit integration
+- [x] Streamlit integration (Step 6 panel)
+
+### Milestone 2 — Meeting Intelligence Pipeline
+- [x] Task 1 — LLM service hardening
+  - [x] Prompt templates (named constants)
+  - [x] Input validation (type check + min length)
+  - [x] Truncation guard (800k chars, sentence-boundary, UI warning)
+  - [x] Retry loop (3 attempts, exponential backoff)
+  - [x] Output validation + coercion (all fields)
+- [x] Task 2 — Meeting Summarization Module
+  - [x] `decisions` field (explicit decisions only)
+  - [x] `participants` field (named persons only)
+  - [x] UI display: 🎯 Key Decisions + 🙋 Participants
+- [x] Task 3 — Action Item Extraction Engine
+  - [x] `priority` field — Gemini path (explicit urgency language only)
+  - [x] `status` field — Gemini path (pending/completed)
+  - [x] `priority` field — Python path (`_determine_priority()` heuristic)
+  - [x] `status` field — Python path (always "pending", documented assumption)
+  - [x] Priority + status badges in UI (both paths, shared helper)
 
 ---
 
@@ -404,4 +446,4 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 
 ---
 
-<p align="center">Built as part of Milestone 1 · Python + Whisper + Gemini 3.5 Flash</p>
+<p align="center">Built across Milestone 1 & 2 · Python + Whisper + Gemini 3.5 Flash</p>

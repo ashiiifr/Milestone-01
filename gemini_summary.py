@@ -1,86 +1,116 @@
 """
 gemini_summary.py
 -----------------
-Natural-language meeting summary via the Google Gemini API.
+Milestone 2 — Meeting Intelligence Pipeline
+LLM service layer for structured meeting analysis via Google Gemini 3.5 Flash.
 
-WHY GEMINI ONLY FOR THE SUMMARY?
-─────────────────────────────────
-Every other extraction task in this project (topics, key points, action items,
-dates, speaker count) is *deterministic* — the answer is either in the text or
-it isn't.  Python regex and NLP libraries can handle those reliably and for
-free, with zero hallucination risk.
+MODEL VERIFICATION (checked 2026-09-02 against official docs):
+  • Model ID: "gemini-3.5-flash"  ← confirmed correct at
+    https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash
+    "Model code: gemini-3.5-flash"  (GA, stable, 1M input tokens)
+  • SDK:  google-genai >= 2.0.0
+  • Call: client.interactions.create(model=..., input=..., response_format=...)
+  • Structured output shape: response_format={"type":"text",
+                                              "mime_type":"application/json",
+                                              "schema": <dict>}
+  No changes to model ID or SDK call shape were required.
 
-A *summary* is different.  It requires the model to:
-  • Read the whole transcript as a coherent narrative.
-  • Decide what is important vs. incidental.
-  • Express that in fluent, readable English.
-
-That is genuinely a natural-language understanding task where an LLM adds real
-value.  We still constrain the output tightly (see below) to prevent invention.
-
-HOW WE PREVENT HALLUCINATION
-─────────────────────────────
-1. STRICT SYSTEM INSTRUCTION — the system prompt explicitly forbids the model
-   from inventing names, tasks, or deadlines not present in the transcript.
-
-2. STRUCTURED JSON OUTPUT — we pass a `response_format` with a hard JSON schema
-   via the official google-genai v2 SDK.  The model CANNOT return free text; it
-   must return a JSON object that matches the schema exactly.  Invalid fields
-   are rejected at the API level.
-
-3. SCHEMA DESIGN — every optional field (assigned_to, deadline) uses a nullable
-   type `["string", "null"]`.  This forces the model to explicitly return null
-   rather than guessing.
-
-SDK USED: google-genai >= 2.0.0
-  • Import:  from google import genai
-  • Client:  genai.Client()  (reads GEMINI_API_KEY from environment)
-  • Structured output via: response_format={"type":"text",
-                                            "mime_type":"application/json",
-                                            "schema": <dict>}
-  Verified against: https://ai.google.dev/gemini-api/docs/interactions/structured-output.md
-  (Last checked: 2026-09-02)
+DESIGN
+──────
+All prompt text lives in named constants/functions (TASK 1).
+Input is validated and truncated before any API call (TASK 1).
+The API call is wrapped in a retry loop (TASK 1).
+Output is fully validated and coerced (TASK 1).
+Schema includes decisions, participants (TASK 2) and priority/status on
+action items (TASK 3).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 from dotenv import load_dotenv
 
-# Load GEMINI_API_KEY from .env if present (never hard-coded here)
 load_dotenv()
 
-# ── Model configuration (as specified in the task) ───────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
 _MODEL_ID = "gemini-3.5-flash"
 
-# ── Strict JSON schema for Gemini's response ─────────────────────────────────
-#
-# WHY A STRICT SCHEMA?
-# When you hand an LLM a blank sheet and say "summarise this", it will add
-# headers, bullet points, disclaimers, and invented details.  A JSON schema
-# acts like a form — the model can only fill in the fields we define.  The
-# API enforces this at the transport level: if the model tries to return
-# something outside the schema, the request fails rather than silently
-# returning garbage.
-#
-# Fields:
-#   summary      – one coherent paragraph in plain English
-#   key_points   – list of the most important statements from the meeting
-#   topics       – list of broad subject areas discussed
-#   action_items – list of tasks, each with optional assigned_to and deadline
-#
-_RESPONSE_SCHEMA: dict[str, Any] = {
+# Gemini 3.5 Flash has a 1 M token input window.
+# 1 token ≈ 4 characters on average.  We leave a large margin for the
+# prompt wrapper and reserve output tokens: 800 000 chars is safe.
+_MAX_TRANSCRIPT_CHARS = 800_000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 1 — PROMPT TEMPLATES
+# All prompt text is defined here as named constants / small builder
+# functions.  Editing prompt wording never requires touching call logic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# System instruction: processed before the user message.
+# This is the primary anti-hallucination mechanism.
+SYSTEM_INSTRUCTION: str = """You are a precise meeting analysis assistant.
+Your ONLY source of information is the transcript provided by the user.
+
+STRICT RULES — violating any of these is an error:
+1. NEVER invent, guess, or assume information not explicitly stated in the transcript.
+2. NEVER invent a person's name.
+   - assigned_to MUST be null if no person is explicitly named for a task.
+   - participants MUST contain only names explicitly spoken/written in the transcript.
+3. NEVER invent a deadline. deadline MUST be null if none is mentioned.
+4. NEVER invent a decision. decisions MUST contain only conclusions explicitly
+   stated in the transcript (e.g. "we decided to …", "agreed to …"). Empty list if none.
+5. NEVER add topics, key points, or action items not clearly present in the transcript.
+6. priority: set ONLY when urgency is explicitly signalled by words like
+   "urgent", "ASAP", "critical", "immediately", "by end of day", "EOD", "top priority".
+   Use "high" for those. Use "medium" when a near-term deadline (today/tomorrow/
+   this week) is mentioned. Otherwise return null. NEVER guess priority.
+7. status: return "completed" ONLY if the transcript explicitly states the task
+   is already done/finished/completed. Otherwise return "pending".
+8. Return ONLY the JSON object matching the required schema. No other text.
+9. If the transcript is empty or contains no meaningful content, return empty
+   lists and an empty string for summary."""
+
+
+def build_user_message(transcript: str) -> str:
+    """Wrap the transcript in the standard analysis request message."""
+    divider = "─" * 60
+    return (
+        f"MEETING TRANSCRIPT:\n"
+        f"{divider}\n"
+        f"{transcript.strip()}\n"
+        f"{divider}\n\n"
+        f"Analyse the transcript above and return the JSON object."
+    )
+
+
+def build_full_prompt(transcript: str) -> str:
+    """Combine system instruction + user message into the single input string
+    used by client.interactions.create()."""
+    return f"{SYSTEM_INSTRUCTION}\n\n{build_user_message(transcript)}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 1 + 2 + 3 — STRICT JSON SCHEMA
+# Defines every field the model may return. additionalProperties:false
+# at every level prevents the model adding anything outside this shape.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
+        # ── TASK 2 ─────────────────────────────────────────────────────────
         "summary": {
             "type": "string",
             "description": (
                 "A single coherent paragraph summarising the meeting. "
-                "Must be based strictly on what was said in the transcript. "
-                "Do not add any information not present in the transcript."
+                "Based strictly on the transcript. No invented content."
             ),
         },
         "key_points": {
@@ -88,16 +118,34 @@ _RESPONSE_SCHEMA: dict[str, Any] = {
             "description": "The most important points made during the meeting.",
             "items": {"type": "string"},
         },
-        "topics": {
+        "decisions": {
             "type": "array",
-            "description": "The broad subjects or themes discussed in the meeting.",
+            "description": (
+                "Concrete decisions explicitly made during the meeting "
+                "(e.g. 'Continue with the planned mobile launch'). "
+                "Empty list if no decisions were explicitly stated."
+            ),
             "items": {"type": "string"},
         },
+        "participants": {
+            "type": "array",
+            "description": (
+                "Names of people explicitly mentioned or speaking in the "
+                "transcript. Do NOT invent names. Empty list if none found."
+            ),
+            "items": {"type": "string"},
+        },
+        "topics": {
+            "type": "array",
+            "description": "Broad subjects or themes discussed in the meeting.",
+            "items": {"type": "string"},
+        },
+        # ── TASK 3 ─────────────────────────────────────────────────────────
         "action_items": {
             "type": "array",
             "description": (
                 "Tasks or follow-ups explicitly mentioned. "
-                "Do NOT invent tasks. Only include tasks clearly stated."
+                "Do NOT invent tasks."
             ),
             "items": {
                 "type": "object",
@@ -109,153 +157,311 @@ _RESPONSE_SCHEMA: dict[str, Any] = {
                     "assigned_to": {
                         "type": ["string", "null"],
                         "description": (
-                            "The person assigned, exactly as named in the transcript. "
-                            "Return null if no person is explicitly named."
+                            "Person assigned, exactly as named. "
+                            "null if not explicitly named."
                         ),
                     },
                     "deadline": {
                         "type": ["string", "null"],
                         "description": (
-                            "The deadline exactly as mentioned in the transcript. "
-                            "Return null if no deadline is mentioned."
+                            "Deadline exactly as mentioned. "
+                            "null if not mentioned."
                         ),
                     },
+                    "priority": {
+                        "type": ["string", "null"],
+                        "description": (
+                            "One of 'high', 'medium', 'low', or null. "
+                            "Set 'high' only for explicit urgency words "
+                            "(urgent/ASAP/critical/EOD/top priority). "
+                            "Set 'medium' for near-term deadlines only. "
+                            "null otherwise. NEVER guess."
+                        ),
+                        "enum": ["high", "medium", "low", None],
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": (
+                            "'completed' only if transcript explicitly states "
+                            "task is done. Otherwise 'pending'."
+                        ),
+                        "enum": ["pending", "completed"],
+                    },
                 },
-                "required": ["task", "assigned_to", "deadline"],
+                "required": [
+                    "task", "assigned_to", "deadline", "priority", "status"
+                ],
                 "additionalProperties": False,
             },
         },
     },
-    "required": ["summary", "key_points", "topics", "action_items"],
+    "required": [
+        "summary", "key_points", "decisions", "participants",
+        "topics", "action_items",
+    ],
     "additionalProperties": False,
 }
 
-# ── System instruction sent before the transcript ────────────────────────────
-#
-# This is the primary anti-hallucination mechanism.  It is a system-level
-# instruction (processed before the user input) so the model treats it as
-# a hard constraint, not a polite request.
-#
-_SYSTEM_INSTRUCTION = """You are a precise meeting analysis assistant.
-Your ONLY source of information is the transcript provided by the user.
+# Allowed values for output validation / coercion
+_VALID_PRIORITIES = {"high", "medium", "low"}
+_VALID_STATUSES   = {"pending", "completed"}
 
-STRICT RULES — violating any of these is an error:
-1. NEVER invent, guess, or assume information not explicitly stated in the transcript.
-2. NEVER invent a person's name. If no name is given for a task, assigned_to MUST be null.
-3. NEVER invent a deadline. If no date or time is given for a task, deadline MUST be null.
-4. NEVER add topics, key points, or action items that are not clearly present in the transcript.
-5. The summary MUST be based solely on the transcript content.
-6. Return ONLY the JSON object matching the required schema. No other text.
-7. If the transcript is empty or contains no meaningful content, return empty lists
-   and an empty string for summary."""
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 1 — INPUT VALIDATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Minimum meaningful transcript length (characters).
+# Anything shorter is likely a silence artefact, not a real meeting.
+_MIN_TRANSCRIPT_CHARS = 20
+
+
+def validate_transcript(transcript: Any) -> tuple[str, str | None]:
+    """
+    Validate and normalise the transcript before sending to Gemini.
+
+    Returns:
+        (cleaned_transcript, warning_message_or_None)
+
+    Raises:
+        TypeError  — input is not a string
+        ValueError — input is too short to be meaningful
+    """
+    if not isinstance(transcript, str):
+        raise TypeError(
+            f"transcript must be a str, got {type(transcript).__name__}. "
+            "Pass the text string returned by Whisper."
+        )
+
+    cleaned = transcript.strip()
+
+    if len(cleaned) < _MIN_TRANSCRIPT_CHARS:
+        raise ValueError(
+            f"Transcript is too short ({len(cleaned)} chars, minimum "
+            f"{_MIN_TRANSCRIPT_CHARS}). Nothing to analyse."
+        )
+
+    # ── Truncation guard ────────────────────────────────────────────────────
+    # If the transcript exceeds the safe character budget we truncate at the
+    # last sentence boundary before the limit and surface an honest warning.
+    # We do NOT silently drop content or crash — the caller decides what to
+    # show the user (see generate_meeting_summary return dict).
+    warning: str | None = None
+    if len(cleaned) > _MAX_TRANSCRIPT_CHARS:
+        cutoff = cleaned.rfind(".", 0, _MAX_TRANSCRIPT_CHARS)
+        if cutoff == -1:
+            cutoff = _MAX_TRANSCRIPT_CHARS
+        cleaned  = cleaned[:cutoff + 1].strip()
+        warning  = (
+            f"⚠️ Transcript truncated to {len(cleaned):,} characters "
+            f"(original: {len(transcript.strip()):,} chars). "
+            f"The model's context window limit was approached. "
+            f"Analysis covers only the portion shown."
+        )
+
+    return cleaned, warning
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 1 — OUTPUT VALIDATION & NORMALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalise_action_items(raw: list) -> list[dict[str, Any]]:
+    """
+    Validate and coerce each action item against the schema.
+    Invalid values are coerced to safe defaults rather than crashing.
+    """
+    result = []
+    for item in raw:
+        if not isinstance(item, dict) or "task" not in item:
+            continue  # silently skip malformed items
+
+        # priority — must be "high"/"medium"/"low" or null
+        raw_priority = item.get("priority")
+        if isinstance(raw_priority, str):
+            priority = raw_priority.lower() if raw_priority.lower() in _VALID_PRIORITIES else None
+        else:
+            priority = None  # null or anything non-string → null
+
+        # status — must be "pending" or "completed"; default to "pending"
+        raw_status = item.get("status")
+        if isinstance(raw_status, str) and raw_status.lower() in _VALID_STATUSES:
+            status = raw_status.lower()
+        else:
+            status = "pending"
+
+        result.append({
+            "task":        str(item.get("task", "")).strip(),
+            "assigned_to": item.get("assigned_to") or None,
+            "deadline":    item.get("deadline")    or None,
+            "priority":    priority,
+            "status":      status,
+        })
+    return result
+
+
+def _normalise_response(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Validate all top-level fields, coerce types to safe defaults.
+    Never crashes the UI — always returns a usable dict.
+    """
+    # summary: must be a string
+    summary = data.get("summary", "")
+    if not isinstance(summary, str):
+        summary = str(summary)
+
+    # list fields: must be lists of strings
+    def _safe_str_list(key: str) -> list[str]:
+        val = data.get(key, [])
+        if not isinstance(val, list):
+            return []
+        return [str(x) for x in val if x]
+
+    return {
+        "summary":      summary,
+        "key_points":   _safe_str_list("key_points"),
+        "decisions":    _safe_str_list("decisions"),
+        "participants": _safe_str_list("participants"),
+        "topics":       _safe_str_list("topics"),
+        "action_items": _normalise_action_items(data.get("action_items", [])),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 1 — CLIENT + RETRY LOOP
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_client():
-    """
-    Build and return a google-genai Client.
-
-    The API key is read from the GEMINI_API_KEY environment variable.
-    Raises a clear RuntimeError if the key is missing so the Streamlit UI
-    can display a helpful message rather than a cryptic SDK error.
-    """
-    from google import genai  # imported lazily so the module loads without the key
+    """Build and return a google-genai Client from GEMINI_API_KEY env var."""
+    from google import genai
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(
             "GEMINI_API_KEY environment variable is not set.\n"
             "Add it to your .env file:  GEMINI_API_KEY=your_key_here\n"
-            "Get a key at: https://aistudio.google.com/app/apikey"
+            "Get a free key at: https://aistudio.google.com/app/apikey"
         )
     return genai.Client(api_key=api_key)
 
 
+# Exceptions that are worth retrying (transient network / rate-limit errors).
+# Everything else (auth, bad schema, etc.) should fail fast.
+_RETRY_ATTEMPTS   = 3
+_RETRY_BASE_DELAY = 2.0   # seconds; doubles each attempt
+
+
+def _call_with_retry(client, prompt: str) -> str:
+    """
+    Call the Gemini API with exponential-backoff retry on transient errors.
+
+    Returns the raw output_text string on success.
+    Raises RuntimeError on permanent failure (auth, bad key, exhausted retries).
+    Raises ValueError on schema / JSON errors (caller handles separately).
+    """
+    import httpx  # installed as google-genai dependency
+
+    last_exc: Exception | None = None
+    delay = _RETRY_BASE_DELAY
+
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            interaction = client.interactions.create(
+                model=_MODEL_ID,
+                input=prompt,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": RESPONSE_SCHEMA,
+                },
+            )
+            return interaction.output_text
+
+        # ── Transient errors — retry ────────────────────────────────────────
+        except (TimeoutError, ConnectionError) as exc:
+            last_exc = exc
+        except Exception as exc:
+            # httpx transport errors and google-genai rate-limit errors
+            # surface as generic exceptions; check message to distinguish.
+            msg = str(exc).lower()
+            transient_signals = (
+                "timeout", "rate limit", "rate_limit", "429",
+                "503", "502", "connection", "temporarily",
+            )
+            if any(sig in msg for sig in transient_signals):
+                last_exc = exc
+            else:
+                # Permanent failure — auth error, bad model ID, etc.
+                raise RuntimeError(
+                    f"Gemini API call failed (attempt {attempt}): {exc}"
+                ) from exc
+
+        if attempt < _RETRY_ATTEMPTS:
+            time.sleep(delay)
+            delay *= 2   # exponential backoff
+
+    raise RuntimeError(
+        f"Gemini API call failed after {_RETRY_ATTEMPTS} attempts. "
+        f"Last error: {last_exc}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
 def generate_meeting_summary(transcript: str) -> dict[str, Any]:
     """
-    Call Gemini 3.5 Flash to produce a structured meeting summary.
+    Call Gemini 3.5 Flash and return a fully validated structured analysis.
 
     Args:
-        transcript: The full plain-text transcript string.
+        transcript: Plain-text meeting transcript from Whisper.
 
     Returns:
-        A dict matching the schema above:
         {
-            "summary":      str,
-            "key_points":   [str, ...],
-            "topics":       [str, ...],
-            "action_items": [{"task": str,
-                              "assigned_to": str | null,
-                              "deadline":    str | null}, ...],
+            "summary":        str,
+            "key_points":     [str, ...],
+            "decisions":      [str, ...],       # TASK 2
+            "participants":   [str, ...],       # TASK 2
+            "topics":         [str, ...],
+            "action_items":   [{               # TASK 3
+                "task":        str,
+                "assigned_to": str | null,
+                "deadline":    str | null,
+                "priority":    "high"|"medium"|"low"|null,
+                "status":      "pending"|"completed",
+            }, ...],
+            "_truncation_warning": str | None,  # present if transcript was cut
         }
 
     Raises:
-        RuntimeError:  GEMINI_API_KEY missing or API call fails.
-        ValueError:    Response JSON does not match the expected schema.
+        TypeError   — transcript is not a string
+        ValueError  — transcript too short, or Gemini returned invalid JSON
+        RuntimeError — API key missing, auth failure, or retries exhausted
     """
-    if not transcript or not transcript.strip():
-        return {
-            "summary": "",
-            "key_points": [],
-            "topics": [],
-            "action_items": [],
-        }
+    # ── Input validation + truncation guard ──────────────────────────────────
+    cleaned, trunc_warning = validate_transcript(transcript)
 
-    client = _get_client()
+    # ── Build prompt from templates ───────────────────────────────────────────
+    prompt = build_full_prompt(cleaned)
 
-    # Compose the user message: system instruction + transcript
-    user_input = (
-        f"{_SYSTEM_INSTRUCTION}\n\n"
-        f"MEETING TRANSCRIPT:\n"
-        f"{'─' * 60}\n"
-        f"{transcript.strip()}\n"
-        f"{'─' * 60}\n\n"
-        f"Analyse the transcript above and return the JSON object."
-    )
+    # ── API call with retry ───────────────────────────────────────────────────
+    client   = _get_client()
+    raw_text = _call_with_retry(client, prompt)
 
-    # ── API call — structured output enforced by response_format ─────────────
-    #
-    # The `response_format` parameter tells the API to:
-    #   1. Return content-type application/json
-    #   2. Validate the response against our schema before returning it
-    #
-    # This is the official google-genai v2 Interactions API pattern:
-    #   client.interactions.create(model=..., input=..., response_format=...)
-    #
-    interaction = client.interactions.create(
-        model=_MODEL_ID,
-        input=user_input,
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": _RESPONSE_SCHEMA,
-        },
-    )
-
-    raw_text = interaction.output_text
-
-    # ── Parse and validate the JSON ───────────────────────────────────────────
+    # ── Parse JSON ────────────────────────────────────────────────────────────
     try:
         data = json.loads(raw_text)
     except json.JSONDecodeError as exc:
         raise ValueError(
-            f"Gemini returned invalid JSON.\n"
-            f"Raw response:\n{raw_text[:500]}"
+            f"Gemini returned invalid JSON.\nRaw response (first 500 chars):\n"
+            f"{raw_text[:500]}"
         ) from exc
 
-    # Ensure all required top-level keys are present (defensive check)
-    for key in ("summary", "key_points", "topics", "action_items"):
-        if key not in data:
-            data[key] = [] if key != "summary" else ""
+    # ── Full output validation + normalisation ────────────────────────────────
+    result = _normalise_response(data)
 
-    # Normalise action items: ensure each has all three keys
-    normalised_items = []
-    for item in data.get("action_items", []):
-        if isinstance(item, dict) and "task" in item:
-            normalised_items.append({
-                "task":        str(item.get("task", "")),
-                "assigned_to": item.get("assigned_to") or None,
-                "deadline":    item.get("deadline") or None,
-            })
-    data["action_items"] = normalised_items
+    # Surface truncation warning in the result dict so app.py can display it
+    result["_truncation_warning"] = trunc_warning
 
-    return data
+    return result

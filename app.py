@@ -1,12 +1,11 @@
 """
 app.py
 ------
-Streamlit app for Milestone 1 – Tasks 1 & 10:
-  Whisper Transcription  +  Meeting Analysis (Python extraction + Gemini summary)
+Streamlit app — Milestone 1 (Tasks 1 & 10) + Milestone 2 (Meeting Intelligence Pipeline)
 
 Flow:
   Upload → Validate → Transcribe → Display Transcript
-  → Python Analysis → Gemini Summary (optional)
+  → Python Analysis → Gemini AI Summary (optional)
 """
 
 import streamlit as st
@@ -24,7 +23,7 @@ st.set_page_config(
 )
 
 st.title("🎙️ Meeting Transcriber & Analyser")
-st.caption("Powered by OpenAI Whisper + Google Gemini 3.5 Flash — Milestone 1 · Tasks 1 & 10")
+st.caption("Powered by OpenAI Whisper + Google Gemini 3.5 Flash — Milestone 1 & 2")
 
 # ── Sidebar: model selection ──────────────────────────────────────────────────
 with st.sidebar:
@@ -177,13 +176,57 @@ if "transcript" in st.session_state:
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 6 · Meeting Analysis
+# Step 6 · Meeting Analysis  (Milestone 2 — Meeting Intelligence Pipeline)
 # ══════════════════════════════════════════════════════════════════════════════
 if "transcript" in st.session_state and st.session_state["transcript"]["text"]:
     result = st.session_state["transcript"]
 
     st.markdown("---")
     st.header("🔍 Step 6 · Meeting Analysis")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Helper: render a priority badge inline
+    # ────────────────────────────────────────────────────────────────────────
+    _PRIORITY_COLOUR = {"high": "#d62728", "medium": "#ff7f0e", "low": "#2ca02c"}
+
+    def _priority_badge(priority: str | None) -> str:
+        if not priority:
+            return ""
+        colour = _PRIORITY_COLOUR.get(priority.lower(), "#888")
+        label  = priority.upper()
+        return (
+            f"<span style='background:{colour};color:white;"
+            f"padding:2px 8px;border-radius:8px;font-size:0.78rem;"
+            f"font-weight:bold;'>{label}</span>"
+        )
+
+    def _status_badge(status: str | None) -> str:
+        colour = "#2ca02c" if status == "completed" else "#888"
+        label  = (status or "pending").upper()
+        return (
+            f"<span style='background:{colour};color:white;"
+            f"padding:2px 8px;border-radius:8px;font-size:0.78rem;'>{label}</span>"
+        )
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Shared helper: render an action-items list (used for both paths)
+    # ────────────────────────────────────────────────────────────────────────
+    def _render_action_items(items: list[dict]) -> None:
+        if not items:
+            st.info("No action items detected in this transcript.")
+            return
+        for item in items:
+            assigned = item.get("assigned_to") or "—"
+            deadline = item.get("deadline")    or "—"
+            priority = item.get("priority")
+            status   = item.get("status", "pending")
+            with st.container(border=True):
+                badge_html = _priority_badge(priority) + "  " + _status_badge(status)
+                st.markdown(badge_html, unsafe_allow_html=True)
+                st.markdown(f"**Task:** {item['task']}")
+                col_a, col_d = st.columns(2)
+                col_a.markdown(f"👤 **Assigned to:** {assigned}")
+                col_d.markdown(f"📅 **Deadline:** {deadline}")
 
     # ── 6a. Python-based analysis ────────────────────────────────────────────
     run_analysis = st.button(
@@ -206,15 +249,13 @@ if "transcript" in st.session_state and st.session_state["transcript"]["text"]:
 
         # ── Speaker count ────────────────────────────────────────────────────
         st.subheader("👥 Estimated Speakers")
-        speaker_count = analysis["speaker_count"]
         st.metric(
             label="Distinct voices detected",
-            value=speaker_count,
+            value=analysis["speaker_count"],
             help=(
                 "Estimated using KMeans clustering on Whisper segment features "
                 "(duration, position, log-probability, words-per-second). "
-                "This is an acoustic estimate — it may differ from the true count "
-                "for short or monotone recordings."
+                "Acoustic estimate only — may differ from true count."
             ),
         )
 
@@ -233,7 +274,7 @@ if "transcript" in st.session_state and st.session_state["transcript"]["text"]:
         else:
             st.info("No distinct topics extracted from this transcript.")
 
-        st.markdown(" ")  # spacing after tags
+        st.markdown(" ")
 
         # ── Key discussion points ────────────────────────────────────────────
         st.subheader("💡 Key Discussion Points")
@@ -244,90 +285,95 @@ if "transcript" in st.session_state and st.session_state["transcript"]["text"]:
         else:
             st.info("No key points extracted.")
 
-        # ── Action items ─────────────────────────────────────────────────────
+        # ── Action items (Python path — now includes priority + status) ──────
         st.subheader("✅ Action Items")
-        action_items = analysis["action_items"]
-        if action_items:
-            for item in action_items:
-                assigned = item["assigned_to"] or "—"
-                deadline = item["deadline"] or "—"
-                with st.container(border=True):
-                    st.markdown(f"**Task:** {item['task']}")
-                    col_a, col_d = st.columns(2)
-                    col_a.markdown(f"👤 **Assigned to:** {assigned}")
-                    col_d.markdown(f"📅 **Deadline:** {deadline}")
-        else:
-            st.info("No action items detected in this transcript.")
+        _render_action_items(analysis["action_items"])
 
-        # ── All dates / deadlines found anywhere ─────────────────────────────
+        # ── All dates / deadlines ────────────────────────────────────────────
         all_deadlines = analysis["all_deadlines"]
         if all_deadlines:
             with st.expander(f"📅 All dates/deadlines found ({len(all_deadlines)})"):
                 for d in all_deadlines:
                     st.markdown(f"• {d}")
 
-        # ── 6b. Gemini AI summary ────────────────────────────────────────────
-        st.markdown("---")
-        st.subheader("✨ AI Meeting Summary  *(Gemini 3.5 Flash)*")
-        st.caption(
-            "Gemini reads the full transcript and writes a coherent summary. "
-            "Requires a valid `GEMINI_API_KEY`. "
-            "All output is strictly constrained to what is in the transcript — "
-            "the model cannot invent names, tasks, or dates."
-        )
+    # ── 6b. Gemini AI summary (Milestone 2 — full intelligence pipeline) ─────
+    st.markdown("---")
+    st.subheader("✨ AI Meeting Intelligence  *(Gemini 3.5 Flash)*")
+    st.caption(
+        "Gemini reads the full transcript and produces a structured analysis. "
+        "Requires `GEMINI_API_KEY`. "
+        "All output is strictly constrained to the transcript — "
+        "the model cannot invent names, decisions, tasks, or dates."
+    )
 
-        run_gemini = st.button(
-            "🚀 Generate AI Summary",
-            use_container_width=True,
-            help="Calls Gemini 3.5 Flash. Requires GEMINI_API_KEY.",
-        )
+    run_gemini = st.button(
+        "🚀 Generate AI Summary",
+        use_container_width=True,
+        help="Calls Gemini 3.5 Flash. Requires GEMINI_API_KEY.",
+    )
 
-        if run_gemini:
-            with st.spinner("Calling Gemini 3.5 Flash…"):
-                try:
-                    gemini_result = generate_meeting_summary(result["text"])
-                    st.session_state["gemini_result"] = gemini_result
-                except RuntimeError as exc:
-                    st.error(f"❌ {exc}")
-                except ValueError as exc:
-                    st.error(f"❌ Schema error: {exc}")
-                except Exception as exc:
-                    st.error(f"❌ Unexpected error: {exc}")
+    if run_gemini:
+        with st.spinner("Calling Gemini 3.5 Flash…"):
+            try:
+                gemini_result = generate_meeting_summary(result["text"])
+                st.session_state["gemini_result"] = gemini_result
+            except TypeError as exc:
+                st.error(f"❌ Input error: {exc}")
+            except ValueError as exc:
+                st.error(f"❌ Schema / validation error: {exc}")
+            except RuntimeError as exc:
+                st.error(f"❌ API error: {exc}")
+            except Exception as exc:
+                st.error(f"❌ Unexpected error: {exc}")
 
-        if "gemini_result" in st.session_state:
-            gr = st.session_state["gemini_result"]
+    if "gemini_result" in st.session_state:
+        gr = st.session_state["gemini_result"]
 
-            # Summary paragraph
-            if gr.get("summary"):
-                st.markdown("#### 📝 Summary")
-                st.markdown(gr["summary"])
+        # ── Truncation warning (Task 1) ───────────────────────────────────
+        if gr.get("_truncation_warning"):
+            st.warning(gr["_truncation_warning"])
 
-            # Key points from Gemini
-            if gr.get("key_points"):
-                st.markdown("#### 💡 Key Points")
-                for pt in gr["key_points"]:
-                    st.markdown(f"- {pt}")
+        # ── Summary (Task 2) ──────────────────────────────────────────────
+        if gr.get("summary"):
+            st.markdown("#### 📝 Summary")
+            st.markdown(gr["summary"])
 
-            # Topics from Gemini
-            if gr.get("topics"):
-                st.markdown("#### 📌 Topics")
-                st.markdown("  ".join(
-                    f"`{t}`" for t in gr["topics"]
-                ))
+        # ── Key decisions (Task 2 — new field) ───────────────────────────
+        if gr.get("decisions"):
+            st.markdown("#### 🎯 Key Decisions")
+            for d in gr["decisions"]:
+                st.markdown(f"- {d}")
 
-            # Action items from Gemini
-            if gr.get("action_items"):
-                st.markdown("#### ✅ Action Items")
-                for item in gr["action_items"]:
-                    assigned = item.get("assigned_to") or "—"
-                    deadline = item.get("deadline") or "—"
-                    with st.container(border=True):
-                        st.markdown(f"**Task:** {item['task']}")
-                        col_a, col_d = st.columns(2)
-                        col_a.markdown(f"👤 **Assigned to:** {assigned}")
-                        col_d.markdown(f"📅 **Deadline:** {deadline}")
+        # ── Participants (Task 2 — new field) ────────────────────────────
+        if gr.get("participants"):
+            st.markdown("#### 🙋 Participants")
+            st.markdown("  ".join(
+                f"<span style='background:#e377c2;color:white;"
+                f"padding:3px 9px;border-radius:10px;"
+                f"font-size:0.83rem;'>{p}</span>"
+                for p in gr["participants"]
+            ), unsafe_allow_html=True)
+            st.markdown(" ")
 
-            # Raw JSON expander (useful for debugging / verification)
-            with st.expander("🔎 View raw Gemini JSON response"):
-                import json
-                st.code(json.dumps(gr, indent=2), language="json")
+        # ── Key points ────────────────────────────────────────────────────
+        if gr.get("key_points"):
+            st.markdown("#### 💡 Key Points")
+            for pt in gr["key_points"]:
+                st.markdown(f"- {pt}")
+
+        # ── Topics ────────────────────────────────────────────────────────
+        if gr.get("topics"):
+            st.markdown("#### 📌 Topics")
+            st.markdown("  ".join(f"`{t}`" for t in gr["topics"]))
+
+        # ── Action items (Task 3 — now with priority + status) ────────────
+        if gr.get("action_items") is not None:
+            st.markdown("#### ✅ Action Items")
+            _render_action_items(gr["action_items"])
+
+        # ── Raw JSON (debug / audit) ──────────────────────────────────────
+        with st.expander("🔎 View raw Gemini JSON response"):
+            import json as _json
+            # Exclude internal key from display
+            display = {k: v for k, v in gr.items() if not k.startswith("_")}
+            st.code(_json.dumps(display, indent=2), language="json")

@@ -20,8 +20,17 @@ Extracted by this module
 2. Key topics              – TF-IDF top noun-phrases from the transcript
 3. Key discussion points   – highest-scoring sentences by TF-IDF weight
 4. Action items            – sentences containing imperative / task language
+                             (Milestone 2: now includes priority + status)
 5. Assigned person         – proper-noun directly after assignment keywords
 6. Deadlines / dates       – regex over common date & time expressions
+
+Milestone 2 additions (TASK 3)
+───────────────────────────────
+• action items now include:
+    - priority: "high" | "medium" | null   (keyword-based, never guessed)
+    - status:   always "pending"           (a transcript describes intent,
+                                            not completion — see comment in
+                                            extract_action_items)
 """
 
 from __future__ import annotations
@@ -106,6 +115,17 @@ _DATE_RE = re.compile("|".join(_DATE_PATTERNS), re.IGNORECASE)
 # ── Proper-name heuristic ─────────────────────────────────────────────────────
 # A name: one or two consecutive Title-Case tokens not in the stopword list
 _NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\b")
+
+# ── TASK 3 · Priority heuristic ───────────────────────────────────────────────
+# "high" — sentence contains explicit urgency language
+_HIGH_PRIORITY_RE = re.compile(
+    r"\b(urgent|urgently|asap|a\.s\.a\.p|critical|immediately|"
+    r"top priority|high priority|by end of day|by eod|eod|"
+    r"right away|as soon as possible)\b",
+    re.IGNORECASE,
+)
+# "medium" — sentence contains a near-term date/time reference but no high-priority words
+# We reuse _DATE_RE for this; the logic is in _determine_priority() below.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -406,6 +426,29 @@ def _extract_person(sentence: str) -> str | None:
     return None
 
 
+def _determine_priority(sentence: str) -> str | None:
+    """
+    TASK 3 — Keyword-based priority heuristic for deterministic extraction.
+
+    Rules (in order of precedence):
+      "high"   — sentence contains an explicit urgency word/phrase
+                 (urgent, ASAP, critical, by EOD, top priority, etc.)
+      "medium" — sentence contains a near-term date match but no high-priority
+                 words (today, tomorrow, this week, next Monday, etc.)
+      None     — no urgency signal found
+
+    We never guess: if none of the explicit signals are present, we return None.
+    """
+    if _HIGH_PRIORITY_RE.search(sentence):
+        return "high"
+
+    # "medium": a date is present but no high-priority language
+    if _DATE_RE.search(sentence):
+        return "medium"
+
+    return None
+
+
 def extract_action_items(transcript: str) -> list[dict[str, Any]]:
     """
     Extract action items / tasks from the transcript.
@@ -416,7 +459,11 @@ def extract_action_items(transcript: str) -> list[dict[str, Any]]:
     3. For each candidate sentence:
        a. Try to extract an assigned person (NER + heuristic).
        b. Try to extract a deadline (regex date patterns).
-    4. Return a list of dicts matching the JSON schema.
+       c. Assign priority via keyword heuristic (TASK 3).
+       d. Default status to "pending" — a transcript describes stated intent,
+          not completion.  We never know from text alone that a task is done
+          unless explicitly said; "pending" is the honest safe default.
+    4. Return a list of dicts matching the Milestone 2 schema.
 
     WHY PYTHON?
     Regex and NER over a fixed vocabulary of task-indicating verbs is
@@ -448,11 +495,20 @@ def extract_action_items(transcript: str) -> list[dict[str, Any]]:
 
         person   = _extract_person(sent)
         deadline = _extract_deadline(sent)
+        priority = _determine_priority(sent)
 
+        # status is always "pending" for deterministic extraction.
+        # A meeting transcript records what people *intend* to do;
+        # it does not confirm completion.  The Gemini path may set
+        # "completed" when the transcript explicitly says so, but
+        # our rule-based path cannot reliably detect that nuance,
+        # so we default honestly to "pending".
         action_items.append({
             "task":        sent,
-            "assigned_to": person,    # None → will become null in JSON
-            "deadline":    deadline,  # None → will become null in JSON
+            "assigned_to": person,    # None → null in JSON
+            "deadline":    deadline,  # None → null in JSON
+            "priority":    priority,  # "high" | "medium" | None
+            "status":      "pending",
         })
 
     return action_items
